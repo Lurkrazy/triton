@@ -12,6 +12,324 @@ The Gluon dialect extends Triton's MLIR-based infrastructure with:
 - **Layout Optimization**: Automatically optimizes data layout decisions for performance
 - **Seamless Integration**: Works within the existing Triton compilation pipeline
 
+## Triton Frontend vs. Gluon IR: Key Differences
+
+Understanding when to use the traditional Triton frontend versus Gluon IR is crucial for optimal GPU kernel development. Both approaches expose GPU hardware features and provide developer control, but they differ significantly in their programming models and abstraction levels.
+
+### Programming Model Comparison
+
+#### Traditional Triton Frontend
+The standard Triton frontend (`triton.language`) requires explicit specification of tensor layouts and memory encodings:
+
+```python
+import triton
+import triton.language as tl
+
+@triton.jit
+def traditional_kernel(input_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    # Explicit layout - must specify encoding details
+    input_data = tl.load(input_ptr + offsets, mask=mask)
+    result = input_data * 2.0
+    tl.store(output_ptr + offsets, result, mask=mask)
+```
+
+**Layout Specification Required:**
+```python
+# Manual layout configuration in traditional Triton
+@triton.jit
+def matmul_kernel(a_ptr, b_ptr, c_ptr, M, N, K, 
+                  BLOCK_SIZE_M: tl.constexpr,
+                  BLOCK_SIZE_N: tl.constexpr,
+                  BLOCK_SIZE_K: tl.constexpr):
+    # Explicit tensor shaping and layout management
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    
+    # Manual accumulator initialization with explicit shape
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        # Manual offset calculations and layout considerations
+        a_ptrs = a_ptr + (offs_am[:, None] * K + offs_k[None, :])
+        b_ptrs = b_ptr + (offs_k[:, None] * N + offs_bn[None, :])
+        
+        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+        b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+        accumulator += tl.dot(a, b)
+        
+        offs_k += BLOCK_SIZE_K
+```
+
+#### Gluon IR Frontend  
+Gluon IR (`triton.experimental.gluon`) provides automatic layout inference:
+
+```python
+from triton.experimental import gluon
+from triton.experimental.gluon import language as ttgl
+
+@gluon.jit
+def gluon_kernel(input_ptr, output_ptr, n_elements: ttgl.constexpr):
+    pid = ttgl.program_id(0)
+    offsets = pid * 256 + ttgl.arange(0, 256)
+    mask = offsets < n_elements
+    
+    # Automatic layout inference - no explicit encoding needed
+    input_data = ttgl.load(input_ptr + offsets, mask=mask)
+    result = input_data * 2.0
+    ttgl.store(output_ptr + offsets, result, mask=mask)
+```
+
+**Automatic Layout Inference:**
+```python
+# Automatic layout management in Gluon IR
+@gluon.jit
+def gluon_matmul(a_ptr, b_ptr, c_ptr, M: ttgl.constexpr, N: ttgl.constexpr, K: ttgl.constexpr):
+    pid_m = ttgl.program_id(0)
+    pid_n = ttgl.program_id(1)
+    
+    # Simplified offset calculations - layouts inferred automatically
+    offs_am = pid_m * 64 + ttgl.arange(0, 64)[:, None]
+    offs_bn = pid_n * 64 + ttgl.arange(0, 64)[None, :]
+    offs_k = ttgl.arange(0, 64)
+    
+    # Automatic accumulator layout optimization
+    accumulator = ttgl.zeros((64, 64), dtype=ttgl.float32)
+    
+    for k in range(0, K, 64):
+        # Automatic layout propagation through loads and compute
+        a = ttgl.load(a_ptr + offs_am * K + (k + offs_k))
+        b = ttgl.load(b_ptr + (k + offs_k[:, None]) * N + offs_bn)
+        accumulator += ttgl.dot(a, b)  # Layout automatically optimized for dot product
+    
+    ttgl.store(c_ptr + offs_am * N + offs_bn, accumulator)
+```
+
+### GPU Hardware Feature Exposure
+
+Both frontends expose GPU hardware features, but at different abstraction levels:
+
+#### Traditional Triton: Direct Hardware Control
+```python
+# Explicit shared memory layout control
+@triton.jit
+def traditional_shared_memory(input_ptr, output_ptr, BLOCK_SIZE: tl.constexpr):
+    # Manual shared memory allocation and layout specification
+    shared_mem = tl.zeros([BLOCK_SIZE, BLOCK_SIZE], dtype=tl.float32)
+    
+    # Explicit memory coalescing patterns
+    tid = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    data = tl.load(input_ptr + tid)
+    
+    # Manual synchronization and shared memory usage
+    tl.store(shared_mem_ptr, data)
+    # ... explicit barrier synchronization needed
+```
+
+**Hardware-Specific Features:**
+- Direct control over shared memory layouts
+- Manual specification of memory coalescing patterns
+- Explicit tensor memory accelerator (TMA) usage on Hopper
+- Direct control over warp-level primitives
+- Manual async copy operation management
+
+#### Gluon IR: High-Level Hardware Optimization
+```python
+# Automatic hardware feature utilization
+@gluon.jit  
+def gluon_optimized(input_ptr, output_ptr, n_elements: ttgl.constexpr):
+    # Hardware features automatically selected based on target architecture
+    data = ttgl.load(input_ptr + offsets)  # Automatic TMA usage on Hopper if beneficial
+    
+    # Shared memory usage automatically optimized
+    result = ttgl.dot(data, weights)  # MMA/WMMA instructions automatically selected
+    
+    ttgl.store(output_ptr + offsets, result)  # Optimal memory coalescing automatically applied
+```
+
+**Automatic Hardware Optimization:**
+- Intelligent selection of memory access patterns (TMA vs. traditional loads)
+- Automatic MMA/WMMA instruction utilization based on data layouts
+- Smart shared memory usage without manual management
+- Architecture-specific optimization (Ampere vs. Hopper vs. Blackwell)
+- Automatic async copy optimization
+
+### Developer Control Comparison
+
+#### Traditional Triton: Explicit Control
+**Advantages:**
+- Complete control over memory layouts and access patterns
+- Direct specification of hardware feature usage
+- Predictable performance characteristics
+- Fine-tuned optimization for specific use cases
+
+**Challenges:**
+- Requires deep understanding of GPU architecture
+- Verbose code with manual layout management
+- Error-prone memory access pattern specification
+- Difficult to port across different GPU architectures
+
+```python
+# Explicit layout control in traditional Triton
+@triton.jit
+def explicit_control_example(a_ptr, b_ptr, output_ptr, 
+                           BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+    # Manual specification of blocked layout
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    # Explicit memory access pattern design
+    offs_am = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    offs_bn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
+    
+    # Manual specification of tensor shapes and strides
+    a_ptrs = a_ptr + offs_am  # Requires careful stride calculation
+    b_ptrs = b_ptr + offs_bn  # Manual memory coalescing consideration
+    
+    # Developer responsible for optimal memory access patterns
+    a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+    b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+```
+
+#### Gluon IR: Intelligent Automation with Override Capability
+**Advantages:**
+- Automatic optimization while preserving control when needed
+- Simplified development workflow
+- Portable across GPU architectures
+- Reduced development time and bugs
+
+**Flexibility:**
+- Can override automatic decisions with explicit layouts when needed
+- Provides both high-level abstractions and low-level access
+- Automatic fallback to traditional Triton for unsupported patterns
+
+```python
+# Intelligent automation with override capability
+@gluon.jit
+def flexible_control_example(input_ptr, output_ptr, use_custom_layout: ttgl.constexpr):
+    data = ttgl.load(input_ptr + offsets)  # Automatic layout inference
+    
+    if use_custom_layout:
+        # Override automatic layout when specific control is needed
+        custom_layout = ttgl.BlockedLayout(
+            size_per_thread=[4], threads_per_warp=[32], warps_per_cta=[4], order=[0]
+        )
+        data = ttgl.convert_layout(data, custom_layout)
+    
+    # Continue with automatic optimization
+    result = data * 2.0  # Layout automatically propagated
+    ttgl.store(output_ptr + offsets, result)
+```
+
+### Performance and Use Case Guidelines
+
+#### When to Use Traditional Triton
+**Best For:**
+- Performance-critical kernels requiring fine-tuned control
+- Specific hardware feature exploitation (e.g., specialized TMA patterns)
+- Kernels with unusual memory access patterns
+- Research into new GPU programming techniques
+- Maximum performance extraction from specific architectures
+
+**Examples:**
+- Custom matrix multiplication with non-standard blocking
+- Specialized reduction algorithms with custom shared memory usage
+- Kernels exploiting specific Hopper/Blackwell features
+- Research kernels exploring new algorithmic approaches
+
+#### When to Use Gluon IR
+**Best For:**
+- Rapid prototyping and development
+- Portable kernels across GPU architectures  
+- Standard computational patterns (element-wise, reductions, GEMM)
+- Production kernels where development velocity is important
+- Kernels that need to adapt to different hardware generations
+
+**Examples:**
+- Element-wise tensor operations
+- Standard convolution implementations
+- Transformer attention mechanisms
+- Activation functions and normalization layers
+- General-purpose computational kernels
+
+### Architecture-Specific Benefits
+
+#### NVIDIA GPU Features
+**Traditional Triton:**
+```python
+# Explicit Hopper TMA usage
+@triton.jit
+def explicit_tma_kernel(...):
+    # Manual TMA barrier and copy operations
+    tl.experimental_tensormap_fenceproxy_acquire(...)
+    # Direct control over TMA descriptor usage
+```
+
+**Gluon IR:**
+```python
+# Automatic TMA optimization
+@gluon.jit
+def auto_tma_kernel(...):
+    # TMA automatically used when beneficial for Hopper+ targets
+    data = ttgl.load(...)  # Automatic TMA utilization
+```
+
+#### AMD GPU Features
+**Traditional Triton:**
+```python
+# Explicit MFMA instruction usage
+@triton.jit  
+def explicit_mfma(...):
+    # Manual MFMA layout and instruction selection
+    # Requires AMD-specific layout knowledge
+```
+
+**Gluon IR:**
+```python
+# Automatic MFMA optimization
+@gluon.jit
+def auto_mfma(...):
+    # MFMA automatically selected for matrix operations on CDNA architectures
+    result = ttgl.dot(a, b)  # Optimal MFMA usage automatically applied
+```
+
+### Migration Path
+
+For teams transitioning between approaches:
+
+1. **Start with Gluon IR** for rapid development and prototyping
+2. **Profile and identify bottlenecks** using automatic optimization
+3. **Selectively use traditional Triton** for performance-critical sections
+4. **Leverage hybrid approaches** where Gluon handles standard patterns and traditional Triton handles specialized optimizations
+
+```python
+# Hybrid approach example
+@gluon.jit
+def hybrid_kernel(input_ptr, output_ptr, specialized_section: ttgl.constexpr):
+    # Standard operations use Gluon automatic optimization
+    data = ttgl.load(input_ptr + offsets)
+    
+    if specialized_section:
+        # Drop to traditional Triton for specialized control
+        # (Implementation would require careful interface design)
+        result = custom_triton_operation(data)
+    else:
+        # Continue with automatic optimization
+        result = data * 2.0
+    
+    ttgl.store(output_ptr + offsets, result)
+```
+
+This comparison demonstrates that both Triton frontend and Gluon IR provide comprehensive GPU hardware access, but Gluon IR adds an intelligent automation layer that reduces complexity while preserving the ability to override automatic decisions when maximum control is needed.
+
 ## Core Concepts
 
 ### Auto-Encoding
